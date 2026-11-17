@@ -1,11 +1,10 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import yt_dlp
-import spotipy
-from spotipy.oauth2 import SpotifyClientCredentials
 from rapidfuzz import fuzz
-import os
+import requests
+import json
 import re
 
 app = FastAPI()
@@ -17,15 +16,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-
-sp = spotipy.Spotify(
-    auth_manager=SpotifyClientCredentials(
-        client_id=os.getenv("SPOTIPY_CLIENT_ID"),
-        client_secret=os.getenv("SPOTIPY_CLIENT_SECRET")
-    )
-)
-
 
 ydl_opts = {
     "quiet": True,
@@ -40,12 +30,58 @@ BASE_BAD_KEYWORDS = [
     "instrumental", "8d", "nightcore", "bass boosted", "reaction", "review"
 ]
 
-
 OFFICIAL_LABELS = [
     "vevo", "topic", "official", "sony", "t-series", "zee", 
     "warner", "universal", "monstercat", "record", "music", 
     "entertainment", "audio", "anirudh", "think music", "saregama", "lahari"
 ]
+
+def fetch_spotify_embed_playlist(playlist_url: str) -> dict:
+    """Fetches public playlist metadata and tracks via Spotify's embed endpoint without API keys."""
+    match = re.search(r"playlist/([a-zA-Z0-9]+)", playlist_url)
+    if not match:
+        raise ValueError("Invalid Spotify playlist URL")
+    
+    playlist_id = match.group(1)
+    embed_url = f"https://open.spotify.com/embed/playlist/{playlist_id}"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    }
+    
+    resp = requests.get(embed_url, headers=headers, timeout=15)
+    if resp.status_code != 200:
+        raise ValueError(f"Failed to fetch playlist (HTTP {resp.status_code})")
+        
+    next_data = re.search(
+        r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>',
+        resp.text,
+        re.DOTALL
+    )
+    if not next_data:
+        raise ValueError("Could not parse playlist data from Spotify embed page")
+        
+    data = json.loads(next_data.group(1))
+    entity = data["props"]["pageProps"]["state"]["data"]["entity"]
+    track_list = entity.get("trackList", [])
+    
+    parsed_tracks = []
+    for t in track_list:
+        # 'subtitle' holds the artist(s), sometimes separated by non-breaking spaces
+        artist_str = (t.get("subtitle") or "").replace("\xa0", " ").strip()
+        primary_artist = artist_str.split(",")[0].strip() if artist_str else ""
+        parsed_tracks.append({
+            "name": (t.get("title") or "").strip(),
+            "artist": primary_artist,
+            "album": "",  # Embed payload doesn't include album name, handled gracefully in best_youtube
+            "duration_ms": t.get("duration", 0)
+        })
+        
+    return {
+        "id": playlist_id,
+        "name": entity.get("name") or entity.get("title", "Spotify Playlist"),
+        "owner": entity.get("subtitle", "Spotify"),
+        "tracks": parsed_tracks
+    }
 
 def clean_text(text: str) -> str:
     """Normalize text for comparison."""
@@ -63,7 +99,6 @@ def get_channel_trust_score(channel_name: str, artist_name: str) -> int:
     artist_norm = artist_name.lower()
     score = 0
 
-
     if fuzz.partial_ratio(artist_norm, channel_norm) > 85:
         score += 50
     if "topic" in channel_norm:
@@ -75,7 +110,6 @@ def get_channel_trust_score(channel_name: str, artist_name: str) -> int:
     return score
 
 def best_youtube(title, artist, album, target_duration):
-
     search_query_parts = [title, artist]
     
     is_generic_album = any(x in album.lower() for x in ["greatest hits", "best of", "single", "compilation"])
@@ -87,7 +121,6 @@ def best_youtube(title, artist, album, target_duration):
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         try:
-
             search = ydl.extract_info(f"ytsearch15:{query}", download=False)
         except Exception:
             return None
@@ -98,11 +131,9 @@ def best_youtube(title, artist, album, target_duration):
     target_artist_norm = clean_text(artist)
     target_album_norm = clean_text(album)
     
-    current_bad_keywords = []
-    for bad in BASE_BAD_KEYWORDS:
-        if bad in target_title_norm:
-            continue 
-        current_bad_keywords.append(bad)
+    current_bad_keywords = [
+        bad for bad in BASE_BAD_KEYWORDS if bad not in target_title_norm
+    ]
 
     for e in search.get("entries", []):
         if not e: continue
@@ -118,20 +149,20 @@ def best_youtube(title, artist, album, target_duration):
         if any(bad in yt_title_norm for bad in current_bad_keywords):
             continue
 
-        diff = abs(yt_duration - target_duration)
-        if diff > 60: 
+        diff = abs(yt_duration - target_duration) if target_duration else 0
+        if target_duration and diff > 60: 
             continue
 
         score = 0
-        
         score += fuzz.token_set_ratio(target_title_norm, yt_title_norm)
         
         if target_album_norm and fuzz.partial_ratio(target_album_norm, yt_title_norm) > 80:
             score += 20
 
         score += get_channel_trust_score(yt_channel, artist)
-        if diff <= 5: score += 25
-        elif diff <= 15: score += 15
+        if target_duration:
+            if diff <= 5: score += 25
+            elif diff <= 15: score += 15
 
         if yt_views > 1000000: score += 15
         elif yt_views > 100000: score += 10
@@ -162,36 +193,22 @@ class ImportReq(BaseModel):
     playlistUrl: str
     limit: int | None = None
 
-
 @app.post("/preview-spotify")
 def preview_spotify(data: ImportReq):
     try:
-        playlist_id = data.playlistUrl.split("/")[-1].split("?")[0]
-        playlist = sp.playlist(playlist_id)
+        playlist = fetch_spotify_embed_playlist(data.playlistUrl)
     except Exception as e:
         return {"error": str(e)}
 
-    total_duration_ms = 0
-    offset = 0
-
-    while True:
-        resp = sp.playlist_items(playlist_id, limit=100, offset=offset)
-        items = resp["items"]
-        if not items: break
-
-        for item in items:
-            if item["track"]:
-                total_duration_ms += item["track"]["duration_ms"]
-
-        offset += 100
-
+    total_duration_ms = sum(t["duration_ms"] for t in playlist["tracks"])
     mins = total_duration_ms // 60000
+
     return {
         "playlist": {
-            "id": playlist_id,
+            "id": playlist["id"],
             "name": playlist["name"],
-            "owner": playlist["owner"]["display_name"],
-            "total_tracks": playlist["tracks"]["total"],
+            "owner": playlist["owner"],
+            "total_tracks": len(playlist["tracks"]),
             "duration": f"{mins // 60} hr {mins % 60} min"
         }
     }
@@ -199,40 +216,26 @@ def preview_spotify(data: ImportReq):
 @app.post("/import-spotify")
 def import_spotify(data: ImportReq):
     try:
-        playlist_id = data.playlistUrl.split("/")[-1].split("?")[0]
-        playlist_meta = sp.playlist(playlist_id)
-    except:
-        return {"error": "Invalid Spotify URL"}
+        playlist = fetch_spotify_embed_playlist(data.playlistUrl)
+    except Exception as e:
+        return {"error": str(e)}
 
-    tracks = []
-    offset = 0
-
-    while True:
-        resp = sp.playlist_items(playlist_id, limit=50, offset=offset)
-        if not resp["items"]: break
-        tracks.extend(resp["items"])
-        offset += 50
-        if data.limit and len(tracks) >= data.limit:
-            break
-
+    tracks = playlist["tracks"]
     if data.limit:
         tracks = tracks[:data.limit]
 
     songs = []
     skipped = {"spotify_unavailable": 0, "no_youtube_match": 0}
 
-    for item in tracks:
-        track = item.get("track")
-        if not track:
+    for track in tracks:
+        if not track["name"]:
             skipped["spotify_unavailable"] += 1
             continue
 
-        album_name = track["album"]["name"] if track.get("album") else ""
-
         yt = best_youtube(
             track["name"],
-            track["artists"][0]["name"],
-            album_name, 
+            track["artist"],
+            track["album"],
             track["duration_ms"] // 1000
         )
 
@@ -243,9 +246,9 @@ def import_spotify(data: ImportReq):
 
     return {
         "playlist": {
-            "id": playlist_id,
-            "name": playlist_meta["name"],
-            "total_tracks": playlist_meta["tracks"]["total"]
+            "id": playlist["id"],
+            "name": playlist["name"],
+            "total_tracks": len(playlist["tracks"])
         },
         "stats": {
             "processed": len(tracks),
